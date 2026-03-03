@@ -82,3 +82,54 @@ func _get_fingerprint() -> Dictionary:
 		"os": {"name": OS.get_name(), "version": OS.get_version()},
 		"hardware": {"cpu": OS.get_processor_name(), "cores": OS.get_processor_count()}
 	}
+
+
+func track_event(category: String, event_name: String, metadata: Dictionary = {}, is_conversion: bool = false):
+	var url = "https://api.glitch.fun/api/titles/%s/events" % title_id
+	var http = HTTPRequest.new()
+	add_child(http)
+	
+	var data = {
+		"game_install_id": install_id,
+		"step_key": category,
+		"action_key": event_name,
+		"metadata": metadata,
+		"conversionEvent": is_conversion,
+		"event_timestamp": Time.get_datetime_string_from_system(true)
+	}
+	
+	var headers = ["Authorization: Bearer " + title_token, "Content-Type: application/json"]
+	http.request(url, headers, HTTPClient.METHOD_POST, JSON.stringify(data))
+	await http.request_completed
+	http.queue_free()
+
+# --- NEW: CLOUD SAVES ---
+func upload_save(slot_index: int, save_data: Dictionary, save_type: String = "manual"):
+	var json_data = JSON.stringify(save_data)
+	var bytes = json_data.to_utf8_buffer()
+	
+	var payload = {
+		"slot_index": slot_index,
+		"save_type": save_type,
+		"payload": Marshalls.raw_to_base64(bytes),
+		"checksum": _calculate_checksum(bytes),
+		"client_timestamp": Time.get_datetime_string_from_system(true)
+	}
+	
+	var url = "https://api.glitch.fun/api/titles/%s/installs/%s/saves" % [title_id, install_id]
+	var http = HTTPRequest.new()
+	add_child(http)
+	
+	var headers = ["Authorization: Bearer " + title_token, "Content-Type: application/json"]
+	http.request(url, headers, HTTPClient.METHOD_POST, JSON.stringify(payload))
+	
+	var response = await http.request_completed
+	if response[1] == 409:
+		print("Glitch Aegis: Save Conflict Detected!")
+	http.queue_free()
+
+func _calculate_checksum(bytes: PackedByteArray) -> String:
+	var ctx = HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA256)
+	ctx.update(bytes)
+	return ctx.finish().hex_encode()
