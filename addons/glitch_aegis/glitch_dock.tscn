@@ -1,4 +1,4 @@
-[gd_scene load_steps=2 format=3 uid="uid://c8y7x6w5v4u32"]
+[gd_scene load_steps=2 format=3 uid="uid://glitch_dock_v2"]
 
 [ext_resource type="Script" path="res://addons/glitch_aegis/glitch_dock.gd" id="1_dock"]
 
@@ -11,35 +11,134 @@ grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_dock")
 
-[node name="VBoxContainer" type="VBoxContainer" parent="."]
+[node name="Root" type="VBoxContainer" parent="."]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
 offset_left = 10.0
-offset_top = 10.0
+offset_top = 8.0
 offset_right = -10.0
-offset_bottom = -10.0
+offset_bottom = -8.0
 grow_horizontal = 2
 grow_vertical = 2
+theme_override_constants/separation = 6
 
-[node name="Header" type="Label" parent="VBoxContainer"]
+[node name="Header" type="Label" parent="Root"]
 layout_mode = 2
-text = "GLITCH AEGIS DEVELOPER CONSOLE"
+text = "🎮  GLITCH AEGIS DEVELOPER CONSOLE  v2.0"
 horizontal_alignment = 1
+theme_override_font_sizes/font_size = 13
 
-[node name="HSeparator" type="HSeparator" parent="VBoxContainer"]
+[node name="HSep0" type="HSeparator" parent="Root"]
 layout_mode = 2
 
-[node name="StatusLabel" type="Label" parent="VBoxContainer"]
+[node name="StatusContainer" type="HBoxContainer" parent="Root"]
 layout_mode = 2
-text = "Status: Idle"
-horizontal_alignment = 1
 
-[node name="TestButton" type="Button" parent="VBoxContainer"]
-custom_minimum_size = Vector2(200, 40)
+[node name="StatusIcon" type="Label" parent="Root/StatusContainer"]
 layout_mode = 2
-size_flags_horizontal = 4
+text = "Status:"
+theme_override_font_sizes/font_size = 12
+
+[node name="StatusLabel" type="Label" parent="Root/StatusContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Idle — click 'Test API Connection' to verify your credentials."
+theme_override_font_sizes/font_size = 12
+
+[node name="HSep1" type="HSeparator" parent="Root"]
+layout_mode = 2
+
+[node name="InfoGrid" type="GridContainer" parent="Root"]
+layout_mode = 2
+columns = 2
+theme_override_constants/h_separation = 16
+theme_override_constants/v_separation = 4
+
+[node name="TitleIDKey" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Title ID:"
+theme_override_font_sizes/font_size = 11
+
+[node name="TitleIDValue" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "(not set)"
+theme_override_font_sizes/font_size = 11
+size_flags_horizontal = 3
+
+[node name="TokenKey" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Title Token:"
+theme_override_font_sizes/font_size = 11
+
+[node name="TokenValue" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "(not set)"
+theme_override_font_sizes/font_size = 11
+size_flags_horizontal = 3
+
+[node name="TestIDKey" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Test Install ID:"
+theme_override_font_sizes/font_size = 11
+
+[node name="TestIDValue" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "(not set)"
+theme_override_font_sizes/font_size = 11
+size_flags_horizontal = 3
+
+[node name="HeartbeatKey" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Auto Heartbeat:"
+theme_override_font_sizes/font_size = 11
+
+[node name="HeartbeatValue" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Enabled"
+theme_override_font_sizes/font_size = 11
+size_flags_horizontal = 3
+
+[node name="ValidateKey" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Require Validation:"
+theme_override_font_sizes/font_size = 11
+
+[node name="ValidateValue" type="Label" parent="Root/InfoGrid"]
+layout_mode = 2
+text = "Optional"
+theme_override_font_sizes/font_size = 11
+size_flags_horizontal = 3
+
+[node name="HSep2" type="HSeparator" parent="Root"]
+layout_mode = 2
+
+[node name="ButtonRow" type="HBoxContainer" parent="Root"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="ConnectBtn" type="Button" parent="Root/ButtonRow"]
+custom_minimum_size = Vector2(200, 32)
+layout_mode = 2
 text = "Test API Connection"
 
-[connection signal="pressed" from="VBoxContainer/TestButton" to="." method="_on_test_connection_pressed"]
+[node name="RefreshBtn" type="Button" parent="Root/ButtonRow"]
+custom_minimum_size = Vector2(120, 32)
+layout_mode = 2
+text = "Refresh Settings"
+
+[node name="DocsBtn" type="Button" parent="Root/ButtonRow"]
+custom_minimum_size = Vector2(140, 32)
+layout_mode = 2
+text = "Open Docs ↗"
+
+[node name="HintLabel" type="Label" parent="Root"]
+layout_mode = 2
+text = "Tip: Set your Title ID and Title Token in Project > Project Settings > Glitch > Config"
+theme_override_font_sizes/font_size = 10
+modulate = Color(0.7, 0.7, 0.7, 1)
+
+[connection signal="pressed" from="Root/ButtonRow/ConnectBtn"  to="." method="_on_connect_btn_pressed"]
+[connection signal="pressed" from="Root/ButtonRow/DocsBtn"     to="." method="_on_docs_btn_pressed"]
+[connection signal="pressed" from="Root/ButtonRow/RefreshBtn"  to="." method="_on_refresh_btn_pressed"]
