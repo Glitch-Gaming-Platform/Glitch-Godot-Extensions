@@ -1,14 +1,14 @@
 # ===========================================================================
-# Glitch Aegis — Singleton (glitch_singleton.gd)
-# Autoloaded as "Glitch". Provides payouts, DRM, analytics, cloud saves,
-# and event tracking for your Godot game on the Glitch Gaming Platform.
+# Glitch Aegis v3.0 — Singleton (glitch_singleton.gd)
+# Autoloaded as "Glitch". Provides payouts, DRM, achievements, leaderboards,
+# cloud saves, analytics, purchases, fingerprinting, and Steam-to-Glitch bridge.
 #
 # Compatible with Godot 4.x
 # ===========================================================================
 extends Node
 
 # ---------------------------------------------------------------------------
-# Signals — connect to these in your own scripts if you need callbacks
+# Signals
 # ---------------------------------------------------------------------------
 signal handshake_succeeded(install_uuid: String)
 signal handshake_failed(reason: String)
@@ -18,6 +18,9 @@ signal heartbeat_sent
 signal save_uploaded(version: int)
 signal save_conflict_detected(conflict_id: String, server_version: int)
 signal save_list_received(saves: Array)
+signal achievements_loaded(success: bool)
+signal achievement_unlocked(api_key: String)
+signal leaderboard_received(board_key: String, entries: Array)
 
 # ---------------------------------------------------------------------------
 # Internal state
@@ -35,14 +38,26 @@ var _require_validation: bool = false
 var _enable_fingerprinting: bool = true
 var _enable_events: bool = true
 var _enable_cloud_saves: bool = true
+var _enable_achievements: bool = true
+var _enable_leaderboards: bool = true
+var _enable_steam_bridge: bool = false
 var _access_denied_overlay: CanvasLayer = null
 var _is_initialized: bool = false
 
 # Tracks the last known save version per slot for conflict detection
 var _save_versions: Dictionary = {}   # { slot_index -> version }
 
+# Achievement cache: { "api_key" -> { "status": "locked"|"unlocked", "progress": float } }
+var _achievement_cache: Dictionary = {}
+var _achievements_loaded: bool = false
+
+# Steam bridge pending buffers
+var _steam_pending_stats: Dictionary = {}    # { api_key -> value }
+var _steam_pending_scores: Dictionary = {}   # { board_key -> score }
+
+
 # ---------------------------------------------------------------------------
-# _ready — Called automatically when the Autoload is added to the scene tree
+# _ready
 # ---------------------------------------------------------------------------
 func _ready() -> void:
 	_load_settings()
@@ -57,12 +72,10 @@ func _ready() -> void:
 
 
 # ---------------------------------------------------------------------------
-# PUBLIC API
+# PUBLIC API — Core
 # ---------------------------------------------------------------------------
 
 ## Call this manually if auto_start_heartbeat is disabled.
-## It resolves the install ID, sends the first heartbeat, and optionally
-## validates the license (if require_validation is true).
 func initialize() -> void:
 	if _is_initialized:
 		return
@@ -77,11 +90,10 @@ func initialize() -> void:
 			push_warning("Glitch Aegis: No install_id found. Payouts disabled. Set a Test Install ID in Project Settings for local testing.")
 		return
 
-	# Register / update the install record and get back the server-side UUID
 	await _register_install()
 
 
-## Start the payout heartbeat manually (if auto_start_heartbeat is off).
+## Start the payout heartbeat manually.
 func start_heartbeat() -> void:
 	if _heartbeat_active:
 		return
@@ -107,18 +119,218 @@ func is_heartbeat_active() -> bool:
 	return _heartbeat_active
 
 
-## Manually validate the current session against the Glitch API.
-## Returns a Dictionary: { "valid": bool, "user_name": String, ... }
+## Manually validate the current session.
 func validate_session() -> Dictionary:
 	if install_id.is_empty():
 		return {"valid": false, "reason": "NO_INSTALL_ID"}
 	return await _do_validation(install_id)
 
 
+# ---------------------------------------------------------------------------
+# PUBLIC API — Achievements
+# ---------------------------------------------------------------------------
+
+## Report progress toward an achievement. If progress meets the threshold,
+## Glitch unlocks it automatically. Use value=1 for simple one-shot unlocks.
+##
+## Example: Glitch.report_achievement("boss_killed", 1)
+## Example: Glitch.report_achievement("coin_collector", 50)
+func report_achievement(api_key: String, value: float = 1.0) -> void:
+	if not _enable_achievements:
+		return
+	if install_id.is_empty():
+		push_warning("Glitch Aegis: Cannot report achievement — not yet initialized.")
+		return
+
+	var url := "https://api.glitch.fun/api/titles/%s/installs/%s/submit" % [title_id, install_id]
+	var payload := {
+		"idempotency_key": _uuid4(),
+		"payload": {
+			"stats": { api_key: value }
+		}
+	}
+
+	var http := _new_http()
+	http.request(url, _auth_json_headers(), HTTPClient.METHOD_POST, JSON.stringify(payload))
+	var response: Array = await http.request_completed
+	http.queue_free()
+
+	var code: int = response[1]
+	if code >= 200 and code < 300:
+		print("Glitch Aegis: Achievement progress sent: %s = %s" % [api_key, str(value)])
+		# Check for newly unlocked
+		var body: Dictionary = _parse_json(response[3].get_string_from_utf8())
+		var newly := body.get("newly_unlocked", [])
+		if newly is Array:
+			for ach in newly:
+				if ach is Dictionary:
+					var key: String = ach.get("api_key", "")
+					if not key.is_empty():
+						_achievement_cache[key] = {"status": "unlocked", "progress": value}
+						emit_signal("achievement_unlocked", key)
+						print("Glitch Aegis: Achievement UNLOCKED: %s" % key)
+	else:
+		push_warning("Glitch Aegis: Achievement report failed (HTTP %d)" % code)
+
+
+## Check if an achievement is unlocked (uses local cache — instant, no network).
+##
+## Example: if Glitch.is_achievement_unlocked("boss_killed"): show_trophy()
+func is_achievement_unlocked(api_key: String) -> bool:
+	var ach: Dictionary = _achievement_cache.get(api_key, {})
+	return ach.get("status", "locked") == "unlocked"
+
+
+## Get the progress value of an achievement (local cache).
+func get_achievement_progress(api_key: String) -> float:
+	var ach: Dictionary = _achievement_cache.get(api_key, {})
+	return float(ach.get("progress", 0))
+
+
+## Force-reload achievement data from the server.
+func refresh_achievements() -> void:
+	await _load_achievements()
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC API — Leaderboards
+# ---------------------------------------------------------------------------
+
+## Submit a score to a leaderboard.
+##
+## Example: Glitch.submit_score("high_score", 5000)
+func submit_score(board_key: String, score: float) -> void:
+	if not _enable_leaderboards:
+		return
+	if install_id.is_empty():
+		push_warning("Glitch Aegis: Cannot submit score — not yet initialized.")
+		return
+
+	var url := "https://api.glitch.fun/api/titles/%s/installs/%s/submit" % [title_id, install_id]
+	var payload := {
+		"idempotency_key": _uuid4(),
+		"payload": {
+			"scores": { board_key: score }
+		}
+	}
+
+	var http := _new_http()
+	http.request(url, _auth_json_headers(), HTTPClient.METHOD_POST, JSON.stringify(payload))
+	var response: Array = await http.request_completed
+	http.queue_free()
+
+	if response[1] >= 200 and response[1] < 300:
+		print("Glitch Aegis: Score submitted: %s = %s" % [board_key, str(score)])
+	else:
+		push_warning("Glitch Aegis: Score submission failed (HTTP %d)" % response[1])
+
+
+## Download leaderboard entries. Returns an Array of Dictionaries.
+## Also emits leaderboard_received(board_key, entries).
+##
+## Example: var entries = await Glitch.get_leaderboard("high_score")
+func get_leaderboard(board_key: String) -> Array:
+	if install_id.is_empty():
+		push_warning("Glitch Aegis: Cannot get leaderboard — not yet initialized.")
+		return []
+
+	var url := "https://api.glitch.fun/api/titles/%s/leaderboards/%s" % [title_id, board_key]
+	var http := _new_http()
+	http.request(url, _auth_headers(), HTTPClient.METHOD_GET)
+
+	var response: Array = await http.request_completed
+	http.queue_free()
+
+	if response[1] == 200:
+		var result: Dictionary = _parse_json(response[3].get_string_from_utf8())
+		var entries: Array = result.get("data", [])
+		emit_signal("leaderboard_received", board_key, entries)
+		return entries
+	push_warning("Glitch Aegis: Leaderboard download failed (HTTP %d)" % response[1])
+	return []
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC API — Steam-to-Glitch Bridge
+# ---------------------------------------------------------------------------
+
+## Drop-in replacement for Steamworks set_achievement().
+## Buffers the unlock until steam_store_stats() is called.
+##
+## Example: Glitch.steam_set_achievement("ACH_WIN_GAME")
+func steam_set_achievement(api_name: String) -> void:
+	_steam_pending_stats[api_name] = 100.0
+	print("Glitch Steam Bridge: SetAchievement('%s') buffered." % api_name)
+
+
+## Drop-in replacement for Steamworks set_stat().
+func steam_set_stat_int(stat_name: String, value: int) -> void:
+	_steam_pending_stats[stat_name] = float(value)
+
+
+## Drop-in replacement for Steamworks set_stat() (float variant).
+func steam_set_stat_float(stat_name: String, value: float) -> void:
+	_steam_pending_stats[stat_name] = value
+
+
+## Drop-in replacement for Steamworks upload_leaderboard_score().
+## Buffers the score until steam_store_stats() is called.
+func steam_upload_score(board_key: String, score: float) -> void:
+	_steam_pending_scores[board_key] = score
+	print("Glitch Steam Bridge: UploadScore('%s', %s) buffered." % [board_key, str(score)])
+
+
+## Drop-in replacement for Steamworks get_achievement().
+## Returns true if the achievement is unlocked (local cache).
+func steam_get_achievement(api_name: String) -> bool:
+	return is_achievement_unlocked(api_name)
+
+
+## Drop-in replacement for Steamworks store_stats().
+## Flushes all buffered achievements and scores to Glitch in one request.
+##
+## Example:
+##   Glitch.steam_set_achievement("ACH_WIN_GAME")
+##   Glitch.steam_upload_score("high_score", 5000)
+##   Glitch.steam_store_stats()
+func steam_store_stats() -> void:
+	if install_id.is_empty():
+		push_warning("Glitch Steam Bridge: Cannot flush — not initialized.")
+		return
+
+	if _steam_pending_stats.is_empty() and _steam_pending_scores.is_empty():
+		return
+
+	var url := "https://api.glitch.fun/api/titles/%s/installs/%s/submit" % [title_id, install_id]
+	var inner: Dictionary = {}
+	if not _steam_pending_stats.is_empty():
+		inner["stats"] = _steam_pending_stats.duplicate()
+	if not _steam_pending_scores.is_empty():
+		inner["scores"] = _steam_pending_scores.duplicate()
+
+	var payload := {
+		"idempotency_key": _uuid4(),
+		"payload": inner,
+	}
+
+	_post_json(url, payload)
+	print("Glitch Steam Bridge: Flushed %d stats + %d scores to Glitch." % [_steam_pending_stats.size(), _steam_pending_scores.size()])
+
+	_steam_pending_stats.clear()
+	_steam_pending_scores.clear()
+
+
+## Drop-in replacement for Steamworks request_current_stats().
+## Refreshes the achievement cache from the Glitch server.
+func steam_request_stats() -> void:
+	await _load_achievements()
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC API — Analytics Events
+# ---------------------------------------------------------------------------
+
 ## Track a single gameplay event (for funnel analysis in your dashboard).
-## step_key  — the "location" or stage, e.g. "onboarding", "level_1"
-## action_key — the interaction, e.g. "tutorial_complete", "player_death"
-## metadata  — any extra data you want to attach
 func track_event(step_key: String, action_key: String, metadata: Dictionary = {}) -> void:
 	if not _enable_events:
 		return
@@ -137,9 +349,7 @@ func track_event(step_key: String, action_key: String, metadata: Dictionary = {}
 	_post_json(url, data)
 
 
-## Send multiple events in one network request (better for mobile battery life).
-## events — Array of Dictionaries, each with step_key, action_key, and
-##          optional metadata / event_timestamp fields.
+## Send multiple events in one network request.
 func track_events_bulk(events: Array) -> void:
 	if not _enable_events:
 		return
@@ -147,7 +357,6 @@ func track_events_bulk(events: Array) -> void:
 		push_warning("Glitch Aegis: Cannot bulk-track events — not yet initialized.")
 		return
 
-	# Inject install_id and timestamps into each event if missing
 	var enriched: Array = []
 	for ev in events:
 		var e: Dictionary = ev.duplicate()
@@ -161,14 +370,11 @@ func track_events_bulk(events: Array) -> void:
 	_post_json(url, {"events": enriched})
 
 
+# ---------------------------------------------------------------------------
+# PUBLIC API — Cloud Saves
+# ---------------------------------------------------------------------------
+
 ## Upload a save to the cloud.
-## slot_index   — an integer from 0–99 identifying the save slot
-## save_data    — any Dictionary you want to persist
-## save_type    — "manual", "auto", "checkpoint", or "quicksave"
-## base_version — the version you originally loaded (0 for a brand-new save)
-##
-## On success  emits save_uploaded(new_version)
-## On conflict emits save_conflict_detected(conflict_id, server_version)
 func upload_save(slot_index: int, save_data: Dictionary, save_type: String = "manual", base_version: int = -1) -> void:
 	if not _enable_cloud_saves:
 		return
@@ -176,7 +382,6 @@ func upload_save(slot_index: int, save_data: Dictionary, save_type: String = "ma
 		push_warning("Glitch Aegis: Cannot save — not yet initialized.")
 		return
 
-	# Use the tracked version if the caller didn't specify one
 	var version := base_version
 	if version < 0:
 		version = _save_versions.get(slot_index, 0)
@@ -220,7 +425,6 @@ func upload_save(slot_index: int, save_data: Dictionary, save_type: String = "ma
 
 
 ## Fetch all cloud save slots for this player.
-## Emits save_list_received(saves_array) on success.
 func list_saves() -> Array:
 	if install_id.is_empty():
 		push_warning("Glitch Aegis: Cannot list saves — not yet initialized.")
@@ -236,7 +440,6 @@ func list_saves() -> Array:
 	if response[1] == 200:
 		var result: Dictionary = _parse_json(response[3].get_string_from_utf8())
 		var saves: Array = result.get("data", [])
-		# Cache versions
 		for s in saves:
 			_save_versions[s.get("slot_index", 0)] = s.get("version", 0)
 		emit_signal("save_list_received", saves)
@@ -245,7 +448,6 @@ func list_saves() -> Array:
 
 
 ## Resolve a save conflict after receiving save_conflict_detected.
-## choice: "keep_server" or "use_client"
 func resolve_save_conflict(save_id: String, conflict_id: String, choice: String) -> bool:
 	var url := "https://api.glitch.fun/api/titles/%s/installs/%s/saves/%s/resolve" % [title_id, install_id, save_id]
 	var http := _new_http()
@@ -257,9 +459,11 @@ func resolve_save_conflict(save_id: String, conflict_id: String, choice: String)
 	return response[1] == 200
 
 
+# ---------------------------------------------------------------------------
+# PUBLIC API — Purchases
+# ---------------------------------------------------------------------------
+
 ## Record an in-game purchase or revenue event.
-## data should contain fields like: purchase_type, purchase_amount, currency,
-## transaction_id, item_sku, item_name, quantity, metadata.
 func track_purchase(data: Dictionary) -> void:
 	if install_id.is_empty():
 		push_warning("Glitch Aegis: Cannot track purchase — not yet initialized.")
@@ -270,12 +474,16 @@ func track_purchase(data: Dictionary) -> void:
 	_post_json(url, payload)
 
 
-## Show the access-denied overlay manually (e.g. after your own license check).
+# ---------------------------------------------------------------------------
+# PUBLIC API — Access Denied
+# ---------------------------------------------------------------------------
+
+## Show the access-denied overlay manually.
 func show_access_denied(message: String = "") -> void:
 	_show_access_denied(message)
 
 
-## Hide the access-denied overlay (if you want to allow the player to retry).
+## Hide the access-denied overlay.
 func hide_access_denied() -> void:
 	if _access_denied_overlay and is_instance_valid(_access_denied_overlay):
 		_access_denied_overlay.queue_free()
@@ -294,13 +502,12 @@ func _load_settings() -> void:
 	_enable_fingerprinting = ProjectSettings.get_setting("glitch/config/enable_fingerprinting", true)
 	_enable_events      = ProjectSettings.get_setting("glitch/config/enable_events",         true)
 	_enable_cloud_saves = ProjectSettings.get_setting("glitch/config/enable_cloud_saves",    true)
+	_enable_achievements = ProjectSettings.get_setting("glitch/config/enable_achievements",  true)
+	_enable_leaderboards = ProjectSettings.get_setting("glitch/config/enable_leaderboards",  true)
+	_enable_steam_bridge = ProjectSettings.get_setting("glitch/config/enable_steam_bridge",  false)
 	game_version        = ProjectSettings.get_setting("glitch/config/game_version",          "1.0.0")
 
 
-## Resolve the install ID from (in priority order):
-##   1. URL query string ?install_id=  (Web exports running on Glitch)
-##   2. Command-line argument --install_id=  (Desktop/server builds)
-##   3. Test Install ID from Project Settings  (development / debug builds)
 func _resolve_install_id() -> String:
 	# --- Web export: read from URL ---
 	if OS.has_feature("web"):
@@ -324,7 +531,14 @@ func _resolve_install_id() -> String:
 			if not cli_id.is_empty():
 				return cli_id
 
-	# --- Fallback: test ID from Project Settings (dev builds only) ---
+	# --- Environment variable fallback ---
+	if OS.has_environment("GLITCH_INSTALL_ID"):
+		var env_id: String = OS.get_environment("GLITCH_INSTALL_ID")
+		if not env_id.is_empty():
+			print("Glitch Aegis: install_id from env var: ", env_id)
+			return env_id
+
+	# --- Test ID from Project Settings ---
 	var test_id: String = ProjectSettings.get_setting("glitch/config/test_install_id", "")
 	if not test_id.is_empty():
 		print("Glitch Aegis: Using test_install_id from Project Settings: ", test_id)
@@ -333,7 +547,6 @@ func _resolve_install_id() -> String:
 	return ""
 
 
-## POST to /installs to register the session; stores the returned UUID.
 func _register_install() -> void:
 	var platform := _detect_platform()
 	var data: Dictionary = {
@@ -361,13 +574,16 @@ func _register_install() -> void:
 		print("Glitch Aegis: Session registered. install UUID = ", install_id)
 		emit_signal("handshake_succeeded", install_id)
 
-		# If validation is required, check the license before starting payouts
 		if _require_validation:
 			var ok: bool = await _run_validation_check()
 			if ok:
 				_maybe_start_heartbeat()
 		else:
 			_maybe_start_heartbeat()
+
+		# Auto-load achievements after session is registered
+		if _enable_achievements:
+			_load_achievements()
 	else:
 		push_warning("Glitch Aegis: Install registration failed (HTTP %d)" % code)
 		emit_signal("handshake_failed", "HTTP %d" % code)
@@ -381,8 +597,6 @@ func _maybe_start_heartbeat() -> void:
 		start_heartbeat()
 
 
-## Calls /validate and optionally shows the access-denied screen.
-## Returns true if valid, false otherwise.
 func _run_validation_check() -> bool:
 	var result: Dictionary = await _do_validation(install_id)
 	if result.get("valid", false):
@@ -435,6 +649,41 @@ func _access_denied_message_for(reason: String) -> String:
 
 
 # ---------------------------------------------------------------------------
+# INTERNAL — Achievement Loading
+# ---------------------------------------------------------------------------
+
+func _load_achievements() -> void:
+	if install_id.is_empty():
+		return
+
+	var url := "https://api.glitch.fun/api/titles/%s/installs/%s/achievements" % [title_id, install_id]
+	var http := _new_http()
+	http.request(url, _auth_headers(), HTTPClient.METHOD_GET)
+
+	var response: Array = await http.request_completed
+	http.queue_free()
+
+	if response[1] >= 200 and response[1] < 300:
+		var result: Dictionary = _parse_json(response[3].get_string_from_utf8())
+		var items: Array = result.get("data", [])
+		_achievement_cache.clear()
+		for item in items:
+			if item is Dictionary:
+				var api_key: String = item.get("api_key", "")
+				if not api_key.is_empty():
+					_achievement_cache[api_key] = {
+						"status": item.get("status", "locked"),
+						"progress": float(item.get("progress_value", 0)),
+					}
+		_achievements_loaded = true
+		print("Glitch Aegis: Achievements loaded (%d entries)." % _achievement_cache.size())
+		emit_signal("achievements_loaded", true)
+	else:
+		push_warning("Glitch Aegis: Achievement load failed (HTTP %d). Player may be a guest." % response[1])
+		emit_signal("achievements_loaded", false)
+
+
+# ---------------------------------------------------------------------------
 # HEARTBEAT
 # ---------------------------------------------------------------------------
 
@@ -476,7 +725,6 @@ func _send_heartbeat() -> void:
 	if code == 200 or code == 201:
 		emit_signal("heartbeat_sent")
 	elif code == 403:
-		# License revoked / expired during play — enforce if required
 		stop_heartbeat()
 		if _require_validation:
 			_show_access_denied("Your session has been terminated by the Glitch platform.\n\nCode: 403 Forbidden")
@@ -489,29 +737,24 @@ func _send_heartbeat() -> void:
 # ---------------------------------------------------------------------------
 
 func _show_access_denied(message: String) -> void:
-	# Don't create it twice
 	if _access_denied_overlay and is_instance_valid(_access_denied_overlay):
 		return
 
-	# CanvasLayer renders on top of everything (2D and 3D)
 	_access_denied_overlay = CanvasLayer.new()
-	_access_denied_overlay.layer = 128      # Very high layer so it's above game UI
+	_access_denied_overlay.layer = 128
 	_access_denied_overlay.name = "GlitchAccessDenied"
 
-	# Dark semi-transparent background
 	var bg := ColorRect.new()
 	bg.color = Color(0.0, 0.0, 0.0, 0.92)
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_access_denied_overlay.add_child(bg)
 
-	# Centered container
 	var container := VBoxContainer.new()
 	container.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
 	container.custom_minimum_size = Vector2(520, 0)
 	container.alignment = BoxContainer.ALIGNMENT_CENTER
 	bg.add_child(container)
 
-	# Icon / title
 	var title_lbl := Label.new()
 	title_lbl.text = "🔒  Access Denied"
 	title_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -522,7 +765,6 @@ func _show_access_denied(message: String) -> void:
 	var sep1 := HSeparator.new()
 	container.add_child(sep1)
 
-	# Message
 	var msg_lbl := Label.new()
 	msg_lbl.text = message if message else "You do not have a valid license for this game."
 	msg_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -536,7 +778,6 @@ func _show_access_denied(message: String) -> void:
 	spacer.custom_minimum_size = Vector2(0, 20)
 	container.add_child(spacer)
 
-	# Store button
 	var store_btn := Button.new()
 	store_btn.text = "Visit Glitch Store"
 	store_btn.custom_minimum_size = Vector2(280, 48)
@@ -548,7 +789,6 @@ func _show_access_denied(message: String) -> void:
 	spacer2.custom_minimum_size = Vector2(0, 8)
 	container.add_child(spacer2)
 
-	# Small footer
 	var footer := Label.new()
 	footer.text = "Powered by Glitch Aegis DRM"
 	footer.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -556,10 +796,7 @@ func _show_access_denied(message: String) -> void:
 	footer.add_theme_font_size_override("font_size", 11)
 	container.add_child(footer)
 
-	# Add to the scene tree
 	get_tree().root.call_deferred("add_child", _access_denied_overlay)
-
-	# Pause the game tree so nothing runs underneath
 	get_tree().paused = true
 
 
@@ -575,39 +812,33 @@ func _on_store_button_pressed() -> void:
 func _build_fingerprint() -> Dictionary:
 	var fp: Dictionary = {}
 
-	# Device info
 	fp["device"] = {
 		"model": _get_device_model(),
 		"type": _device_type_string(),
 		"manufacturer": _get_manufacturer(),
 	}
 
-	# OS
 	fp["os"] = {
 		"name": OS.get_name(),
 		"version": OS.get_version(),
 	}
 
-	# Display
 	var screen_size := DisplayServer.screen_get_size()
 	fp["display"] = {
 		"resolution": "%dx%d" % [screen_size.x, screen_size.y],
 		"density": DisplayServer.screen_get_dpi(),
 	}
 
-	# Hardware
 	fp["hardware"] = {
 		"cpu": OS.get_processor_name(),
 		"cores": OS.get_processor_count(),
 	}
 
-	# Environment
 	fp["environment"] = {
 		"language": OS.get_locale(),
 		"timezone": Time.get_time_zone_from_system().get("name", ""),
 	}
 
-	# Desktop-specific data
 	if not OS.has_feature("mobile") and not OS.has_feature("web"):
 		fp["desktop_data"] = {
 			"formFactors": ["Desktop"],
@@ -617,7 +848,6 @@ func _build_fingerprint() -> Dictionary:
 			"wow64": false,
 		}
 
-	# Keyboard layout (Web only — uses JavaScriptBridge)
 	if OS.has_feature("web") and _enable_fingerprinting:
 		var layout: Dictionary = _get_web_keyboard_layout()
 		if not layout.is_empty():
@@ -649,7 +879,7 @@ func _device_type_string() -> String:
 			return "mobile"
 		return "tablet"
 	if OS.has_feature("web"):
-		return "desktop"  # Most browser players are on desktop
+		return "desktop"
 	return "desktop"
 
 
@@ -663,12 +893,10 @@ func _detect_platform() -> String:
 	return OS.get_name().to_lower()
 
 
-## Reads the current keyboard layout via JavaScript (Web exports only).
 func _get_web_keyboard_layout() -> Dictionary:
 	if not OS.has_feature("web"):
 		return {}
 
-	# List of standard key codes we want to map
 	var key_codes := [
 		"KeyQ","KeyW","KeyE","KeyR","KeyT","KeyY","KeyU","KeyI","KeyO","KeyP",
 		"KeyA","KeyS","KeyD","KeyF","KeyG","KeyH","KeyJ","KeyK","KeyL",
@@ -679,7 +907,6 @@ func _get_web_keyboard_layout() -> Dictionary:
 		"Semicolon","Quote","Comma","Period","Slash"
 	]
 
-	# Build JS that returns a JSON string of the layout map
 	var js_code := """
 (function(){
   try {
@@ -687,11 +914,9 @@ func _get_web_keyboard_layout() -> Dictionary:
     var keys = %s;
     var kb = navigator.keyboard;
     if (!kb || !kb.getLayoutMap) return '{}';
-    // getLayoutMap is async; we fall back to a sync approximation
     var map = {};
     keys.forEach(function(code){
       var ev = new KeyboardEvent('keydown', {code: code});
-      // Use the key property from a synthetic event (layout-dependent in some browsers)
       map[code] = ev.key || code;
     });
     return JSON.stringify(map);
@@ -711,7 +936,7 @@ func _get_web_keyboard_layout() -> Dictionary:
 
 func _new_http() -> HTTPRequest:
 	var http := HTTPRequest.new()
-	http.use_threads = false          # Keep main-thread safe
+	http.use_threads = false
 	http.timeout = 15.0
 	add_child(http)
 	return http
@@ -758,4 +983,19 @@ func _sha256_hex(bytes: PackedByteArray) -> String:
 
 
 func _iso_timestamp() -> String:
-	return Time.get_datetime_string_from_system(true)  # UTC
+	return Time.get_datetime_string_from_system(true)
+
+
+func _uuid4() -> String:
+	var hex := "0123456789abcdef"
+	var uuid := ""
+	for i in range(32):
+		if i == 8 or i == 12 or i == 16 or i == 20:
+			uuid += "-"
+		if i == 12:
+			uuid += "4"
+		elif i == 16:
+			uuid += hex[randi() % 4 + 8]
+		else:
+			uuid += hex[randi() % 16]
+	return uuid

@@ -14,6 +14,8 @@ extends Control
 @onready var _test_id_label:  Label  = $Root/InfoGrid/TestIDValue
 @onready var _heartbeat_label:Label  = $Root/InfoGrid/HeartbeatValue
 @onready var _validate_label: Label  = $Root/InfoGrid/ValidateValue
+@onready var _ach_label:      Label  = $Root/InfoGrid/AchievementsValue
+@onready var _steam_label:    Label  = $Root/InfoGrid/SteamBridgeValue
 
 var _http_node: HTTPRequest = null
 
@@ -40,6 +42,13 @@ func _refresh_display() -> void:
 		_heartbeat_label.text = "Enabled" if hb else "Disabled"
 	if is_instance_valid(_validate_label):
 		_validate_label.text = "Required" if rv else "Optional"
+
+	var ach   := ProjectSettings.get_setting("glitch/config/enable_achievements",true)
+	var steam := ProjectSettings.get_setting("glitch/config/enable_steam_bridge", false)
+	if is_instance_valid(_ach_label):
+		_ach_label.text = "Enabled" if ach else "Disabled"
+	if is_instance_valid(_steam_label):
+		_steam_label.text = "Enabled" if steam else "Disabled"
 
 
 ## Called when the "Test API Connection" button is pressed.

@@ -2,7 +2,7 @@
 extends EditorPlugin
 
 # ---------------------------------------------------------------------------
-# Glitch Aegis — Editor Plugin (glitch_plugin.gd)
+# Glitch Aegis v3.0 — Editor Plugin (glitch_plugin.gd)
 # Registers project settings and the editor dock panel.
 # ---------------------------------------------------------------------------
 
@@ -31,6 +31,9 @@ const SETTINGS := {
 	"enable_fingerprinting":["glitch/config/enable_fingerprinting", true, TYPE_BOOL],
 	"enable_events":       ["glitch/config/enable_events",       true,  TYPE_BOOL],
 	"enable_cloud_saves":  ["glitch/config/enable_cloud_saves",  true,  TYPE_BOOL],
+	"enable_achievements": ["glitch/config/enable_achievements", true,  TYPE_BOOL],
+	"enable_leaderboards": ["glitch/config/enable_leaderboards", true,  TYPE_BOOL],
+	"enable_steam_bridge": ["glitch/config/enable_steam_bridge", false, TYPE_BOOL],
 }
 
 var _dock: Control = null
@@ -57,8 +60,6 @@ func _exit_tree() -> void:
 		remove_control_from_bottom_panel(_dock)
 		_dock.queue_free()
 		_dock = null
-	# Note: We intentionally leave project settings intact so developer
-	# configuration is not lost if the plugin is temporarily disabled.
 
 
 func _add_project_setting(setting_name: String, default_value, type: int) -> void:
